@@ -1,0 +1,5 @@
+app/.output/*
+app/driver/.output/*
+app/user/.output/*
+*~
+document/*
