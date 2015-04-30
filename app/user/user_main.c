@@ -21,6 +21,8 @@
 
 #include "espconn.h"
 
+#include "driver/key.h"
+
 
 #define FLASH_HEAD_ADDR 0x3C000
 #define DEFAULT_SSID "iPLUG"
@@ -36,9 +38,8 @@
 #define UDP_FINGERPRINT "I'm HERE, I'm iPLUG."
 
 
-static ETSTimer delay_timer;
-static ETSTimer sta_chk_timer;
-
+static ETSTimer station_chk_timer;
+struct espconn client_conn;
 
 enum DEV_TYPE {
 	DEV_UNKNOWN, DEV_PLUG
@@ -47,6 +48,16 @@ enum DEV_TYPE {
 enum RUN_MODE {
 	MODE_UNKNOWN, WIFI_BOARDCAST, CLIENT_ONLY
 };
+enum CONNECT_STATUS {
+	STATUS_UNKNOWN,
+	STATUS_CONNECTING,
+	STATUS_CONNECTED,
+	STATUS_DISCONNECTED
+};
+
+enum RUN_MODE runmode = MODE_UNKNOWN;
+enum CONNECT_STATUS client_status = STATUS_UNKNOWN; //为1则代表已连接到服务端
+
 
 typedef struct _rw_info{
 	uint32 server_addr;
@@ -63,7 +74,6 @@ typedef struct _rw_info{
 typedef struct _conn_info {
 	unsigned char* buffer;
 	uint32 bufsize;
-	struct espconn conn;
 }conn_context;
 
 
@@ -77,14 +87,27 @@ typedef struct _led_glint {
 }led_glint;
 
 
+typedef struct _heart_timer {
+	struct espconn* conn;
+	ETSTimer* timer;
+} heart_timer;
+
+
+void ICACHE_FLASH_ATTR connect_to_cloud();
+void ICACHE_FLASH_ATTR _gpio_low(void* time_arg);
+void ICACHE_FLASH_ATTR sent_cloud_cb(void* param);
+void ICACHE_FLASH_ATTR _gpio_high(void* time_arg);
+void ICACHE_FLASH_ATTR connected_cloud_cb(void* param);
+void ICACHE_FLASH_ATTR disconnected_cloud_cb(void* param);
+void ICACHE_FLASH_ATTR restart_init_station_chk_timer(int interval);
+void ICACHE_FLASH_ATTR reconnect_cloud_cb(void* param, sint8 errcode);
+void ICACHE_FLASH_ATTR datareceived_cloud_cb(void* param, char* pdata, unsigned short len);
+
+
 conn_context* conn_context_init()
 {
 	conn_context* context = (conn_context*)os_zalloc(sizeof(conn_context));
-	esp_tcp* tcp = (esp_tcp*)os_zalloc(sizeof(esp_tcp));
 
-	context->conn.type = ESPCONN_TCP;
-	context->conn.state = ESPCONN_NONE;
-	context->conn.proto.tcp = tcp;
 	context->buffer = NULL;
 	context->bufsize = 0;
 
@@ -97,10 +120,6 @@ void conn_context_release(conn_context* context)
 	if(context) {
 		if(context->buffer) {
 			os_free(context->buffer);
-		}
-
-		if(context->conn.proto.tcp) {
-			os_free(context->conn.proto.tcp);
 		}
 
 		os_free(context);
@@ -315,54 +334,209 @@ void ICACHE_FLASH_ATTR startup_ledshow(rw_info* rw)
 }
 
 
-void ICACHE_FLASH_ATTR connected_cloud_cb(void* param)
+void ICACHE_FLASH_ATTR heart_beat_cbfn(void* param)
 {
-	os_printf("connected_cloud_cb\n");
+	heart_timer* pheart = (heart_timer*)param;
+	uint8 buf[2];
+
+	buf[0] = 2;
+	buf[1] = 1;
+	espconn_sent(pheart->conn, buf, 2);
 }
 
 
+void ICACHE_FLASH_ATTR connected_cloud_cb(void* param)
+{
+	uint8 rcvbuf[16];
+	struct espconn* conn = (struct espconn*)param;
+
+	os_printf("connected_cloud_cb, conn: [%p]\n", conn);
+	client_status = STATUS_CONNECTED;
+	//注册 断开与接收、发送的回调
+	espconn_regist_recvcb(conn, datareceived_cloud_cb);
+	espconn_regist_sentcb(conn, sent_cloud_cb);
+	espconn_regist_disconcb(conn, disconnected_cloud_cb);
+	//注册心跳回调
+	heart_timer* pheart = (heart_timer*)os_zalloc(sizeof(heart_timer));
+	ETSTimer* timer = (ETSTimer*)os_zalloc(sizeof(ETSTimer));
+	pheart->timer = timer;
+	pheart->conn = conn;
+
+	conn->reverse = (void*)pheart;
+	os_timer_disarm(timer);
+	os_timer_setfn(timer, heart_beat_cbfn, pheart);
+	os_timer_arm(timer, 120000, 1);//两分钟一个心跳包, 重复
+
+	uint32* pchipid = (uint32*)(rcvbuf + 2);
+	rcvbuf[0] = 7;
+	rcvbuf[1] = 0;
+
+	*pchipid = system_get_chip_id();
+	rcvbuf[6] = 1;
+
+	espconn_sent(conn, rcvbuf, 7);
+	os_printf("DEV RP OVER\n");
+}
+
 void ICACHE_FLASH_ATTR reconnect_cloud_cb(void* param, sint8 errcode)
 {
-	os_printf("reconnect_cloud_cb\n");
+	os_printf("reconnect_cloud_cb, code: [%d]\n", errcode);
+	client_status = STATUS_DISCONNECTED;
+	struct espconn* conn = (struct espconn*)param;
+
+	os_printf("conn: [%p] error, close it.\n", conn);
+	espconn_disconnect(conn);
+	os_free(conn->proto.tcp);
+	os_free(conn);
+	if(conn->reverse) {
+		os_printf("pheart struct not empty, free it.\n");
+		heart_timer* pheart = (heart_timer*) conn->reverse;
+//		os_timer_disarm(pheart->timer);
+//		os_free(pheart->timer);
+//		os_free(pheart);
+	}
+	os_printf("free struct conn && tcp\n");
 }
 
 
 void ICACHE_FLASH_ATTR disconnected_cloud_cb(void* param)
 {
-	os_printf("disconnected_cloud_cb\n");
+	struct espconn* conn = (struct espconn*)param;
+
+	os_printf("[%p] disconnected_cloud_cb\n", conn);
+	client_status = STATUS_DISCONNECTED;
+
+	os_free(conn->proto.tcp);
+	os_free(conn);
+	if(conn->reverse) {
+		os_printf("pheart struct not empty, free it.\n");
+		heart_timer* pheart = (heart_timer*) conn->reverse;
+//		os_timer_disarm(pheart->timer);
+//		os_free(pheart->timer);
+//		os_free(pheart);
+	}
+	os_printf("free struct, free ram\n");
+
+	restart_init_station_chk_timer(1000);
 }
 
 
-void ICACHE_FLASH_ATTR datareceived_cloud_cb(void* param, void* pdata, unsigned short len)
+void ICACHE_FLASH_ATTR sent_cloud_cb(void* param)
+{
+	os_printf("DATA TRANSPORTED\n");
+}
+
+
+//这里有可能需要加入 数据包的处理，譬如 多包同时到达，单包分次抵达
+void ICACHE_FLASH_ATTR datareceived_cloud_cb(void* param, char* pdata, unsigned short len)
 {
 	os_printf("datareceived_cloud_cb\n");
+	struct espconn* conn = (struct espconn*)param;
+
+	uint8 pack_len = pdata[0];
+	if(len < pack_len) {
+		os_printf("network error, or pack error, or protocol error\n");
+		espconn_disconnect(conn);
+	}
+
+	uint8 msgtype = pdata[1];
+	if(msgtype == 0) {
+		//
+	} else if (msgtype == 1) {
+		//
+	} else if (msgtype == 2) {
+		//
+	} else if (msgtype == 3) {
+		//
+	}
 }
 
 
 void ICACHE_FLASH_ATTR connect_to_cloud()
 {
+	if(client_status == STATUS_CONNECTING) {
+		os_printf("connecting ... abort.\n");
+		return ;
+	}
+
+	os_printf("connecting to cloud server ... \n");
+	const char server_addr[4] = {211, 155, 86, 145};
 	struct espconn* conn = (struct espconn*)os_zalloc(sizeof(struct espconn));
 	esp_tcp* tcp = (esp_tcp*)os_zalloc(sizeof(esp_tcp));
 
-	os_memcpy(tcp->remote_ip, ipaddr_addr(CLOUD_SERVER), 4);
+	os_memcpy(tcp->remote_ip, server_addr, 4);
+	tcp->local_port = espconn_port();
 	tcp->remote_port = CLOUD_PORT;
 
 	conn->proto.tcp = tcp;
 	conn->type = ESPCONN_TCP;
 	conn->state = ESPCONN_NONE;
+	client_status = STATUS_CONNECTING;
 
+	os_printf("local port: [%d], remote [%d:%d]\n", tcp->local_port, (uint32)tcp->remote_ip, tcp->remote_port);
 	espconn_regist_connectcb(conn, connected_cloud_cb);
 	espconn_regist_reconcb(conn, reconnect_cloud_cb);
 	espconn_connect(conn);
+	os_printf("connect cmd over\n");
 }
 
+
+void ICACHE_FLASH_ATTR init_over()
+{
+	os_printf("SYSTEM INIT COMPLETED\n");
+}
+
+void ICACHE_FLASH_ATTR station_connect_status_check_timercb(void* _timer)
+{
+	ETSTimer* timer = (ETSTimer*)_timer;
+	os_printf("wifi_station_dhcpc_status: [%d]\n", wifi_station_dhcpc_status());
+    if(wifi_station_dhcpc_status() == DHCP_STOPPED && !wifi_station_dhcpc_start()) {
+    	os_printf("wifi_station_dhcpc_start error\n");
+    }
+
+    os_printf("wifi station connect status: [%d]\n", wifi_station_get_connect_status());
+    if(wifi_station_get_connect_status() == STATION_GOT_IP && client_status != STATUS_CONNECTED) {
+    	os_printf("Connected to ROUTER, connecting to cloud\n");
+    	connect_to_cloud();
+    	client_status = STATUS_CONNECTING;
+    }
+
+    if(client_status == STATUS_CONNECTED) {
+    	os_timer_disarm(timer);
+    }
+}
+
+void ICACHE_FLASH_ATTR restart_init_station_chk_timer(int interval)
+{
+	os_printf("启动计时器\n");
+    os_timer_disarm(&station_chk_timer);
+    os_timer_setfn(&station_chk_timer, station_connect_status_check_timercb, &station_chk_timer);
+    os_timer_arm(&station_chk_timer, interval, 1);// 重复，每秒检查一次，若连上后取消，连接断开或其他事件重启此 timer
+    os_printf("station checker timer start completed\n");
+}
+
+
+void ICACHE_FLASH_ATTR user_btn_long_press()
+{
+	os_printf("ON LONG PRESS\n");
+}
+
+
+void ICACHE_FLASH_ATTR user_btn_short_press()
+{
+	os_printf("ON SHORT PRESS\n");
+}
 /******************************************************************************
  * FunctionName : user_init
  * Description  : entry of user application, init user function here
  * Parameters   : none
  * Returns      : none
 *******************************************************************************/
-void user_init(void)
+
+struct keys_param keys;
+struct single_key_param *single_key[1];
+
+void ICACHE_FLASH_ATTR user_init(void)
 {
 	uart_init(BIT_RATE_115200, BIT_RATE_115200);
     show_sysinfo();
@@ -371,8 +545,18 @@ void user_init(void)
     os_memset(&rw, 0, sizeof(rw_info));
 
     read_cfg_flash(&rw);
-    startup_ledshow(&rw);
+    //startup_ledshow(&rw);
 
+    single_key[0] = key_init_single(13, PERIPHS_IO_MUX_MTCK_U, FUNC_GPIO13,
+    		user_btn_long_press, user_btn_short_press);
+
+    keys.key_num = 1;
+    keys.single_key = single_key;
+
+    key_init(&keys);
+
+
+#if 0
     os_printf("ipaddr_addr test\n");
     os_printf("127.0.0.1: [%d]\n", ipaddr_addr("127.0.0.1"));
     os_printf("192.168.0.1: [%d]\n", ipaddr_addr("192.168.0.1"));
@@ -394,12 +578,12 @@ void user_init(void)
         /* need to sure that you are in station mode first,
          * otherwise it will be failed. */
         wifi_station_set_config(&config);
-        /*
-         * 最好开一个定时器，若wifi station状态非GOTIP，则怎么做
-         * 1，可以直接打开softap，打开local server
-         * 2，可以打开某LED闪烁以提示，用户按某按钮后 执行1的操作
-         */
-        connect_to_cloud();
+        wifi_station_set_auto_connect(1);
+
+        //启动定时器，每秒中检查，若连接到路由器，则连接云端
+        //若成功连接到云端，则关闭定时器
+        //若从云端断开连接，则重启定时器
+        restart_init_station_chk_timer(1000);
     } else if (rw.run_mode == WIFI_BOARDCAST) {
     	os_printf("run in wifi_boardcast mode\n");
 //		wifi_set_opmode(SOFTAP_MODE);
@@ -437,5 +621,7 @@ void user_init(void)
     }
 
     os_printf("OVER\n");
+    system_init_done_cb(init_over);
+#endif
 }
 
