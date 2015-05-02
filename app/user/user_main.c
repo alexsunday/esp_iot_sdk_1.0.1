@@ -168,7 +168,6 @@ static struct pack_proc gl_procs[] = {
 	    {SETSSID_RSP, procfn_setssid_rsp},
 	    {RST_REQ, procfn_rst_req},
 	    {RST_RSP, procfn_rst_rsp}
-
 };
 
 
@@ -597,6 +596,13 @@ void procfn_ledtest_req(struct espconn* pconn, char* pdata, unsigned short len)
 {
 	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
 	uint8 buf[2];
+    led_glint* led = (led_glint*)os_zalloc(sizeof(led_glint));
+
+	PIN_FUNC_SELECT(PERIPHS_IO_MUX_MTDI_U, FUNC_GPIO12);
+	led->pin = BIT12;
+    led->interval = 100;
+    led->limit_count = 100;
+    led_glint_control(led);
 
 	buf[0] = sizeof(buf);
 	buf[1] = LEDTEST_RSP;
@@ -611,7 +617,34 @@ void procfn_ledtest_rsp(struct espconn* pconn, char* pdata, unsigned short len)
 void procfn_setssid_req(struct espconn* pconn, char* pdata, unsigned short len)
 {
 	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+	rw_info rw;
 	uint8 buf[2];
+	char* ssid = pdata + 2;
+	uint8 ssid_size = os_strlen(ssid);
+
+	if(!ssid_size || !ssid || ssid_size > 32) {
+		os_printf("ssid size error\n");
+	}
+
+	char* pwd = pdata + 2 + ssid_size + 1;
+	uint8 pwd_size = strlen(pwd);
+	if(!pwd_size || !pwd || pwd_size > 32) {
+		os_printf("ssid pwd size error\n");
+	}
+
+	if(2 + ssid_size + 1 + pwd_size + 1 > len) {
+		os_printf("data error\n");
+	}
+
+	os_printf("recv station config: [%s,%s]\n", ssid, pwd);
+	if(!read_cfg_flash(&rw)) {
+		os_printf("cfg read from flash error\n");
+	}
+
+	os_strcpy(rw.ssid, ssid);
+	os_strcpy(rw.ssid_pwd, pwd);
+	write_rw_hash(&rw);
+	write_cfg_flash(&rw);
 
 	buf[0] = sizeof(buf);
 	buf[1] = SETSSID_RSP;
@@ -633,6 +666,8 @@ void procfn_rst_req(struct espconn* pconn, char* pdata, unsigned short len)
 	buf[1] = RST_RSP;
 
 	espconn_sent(pconn, buf, 2);
+	espconn_disconnect(pconn);
+	system_restart();
 }
 
 void procfn_rst_rsp(struct espconn* pconn, char* pdata, unsigned short len)
