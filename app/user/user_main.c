@@ -10,18 +10,15 @@
 *******************************************************************************/
 #include "ets_sys.h"
 #include "osapi.h"
-
 #include "user_interface.h"
-
 #include "ip_addr.h"
 #include "driver/uart.h"
 #include "eagle_soc.h"
-
 #include "mem.h"
-
 #include "espconn.h"
 
 #include "driver/key.h"
+#include "driver/dht.h"
 
 
 #define FLASH_HEAD_ADDR 0x3C000
@@ -38,7 +35,10 @@
 #define UDP_FINGERPRINT "I'm HERE, I'm iPLUG."
 
 
+// 云端连接检查，定时器
 static ETSTimer station_chk_timer;
+// 开启客户端监听检查。
+static ETSTimer server_listen_chk_timer;
 struct espconn client_conn;
 
 enum DEV_TYPE {
@@ -48,6 +48,7 @@ enum DEV_TYPE {
 enum RUN_MODE {
 	MODE_UNKNOWN, WIFI_BOARDCAST, CLIENT_ONLY
 };
+
 enum CONNECT_STATUS {
 	STATUS_UNKNOWN,
 	STATUS_CONNECTING,
@@ -55,6 +56,33 @@ enum CONNECT_STATUS {
 	STATUS_DISCONNECTED
 };
 
+enum conn_mode {
+	MODE_CLIENT, MODE_SERVER
+};
+
+enum msg_type {
+    DEV_RP_REQ = 0,
+    HEART_REQ = 1,
+    GSTATUS_REQ = 2,
+    SSTATUS_REQ = 3,
+    DEV_RP_RSP = 4,
+    HEART_RSP = 5,
+    GSTATUS_RSP = 6,
+    SSTATUS_RSP = 7,
+    LEDTEST_REQ = 8,
+    LEDTEST_RSP = 9,
+    SETSSID_REQ = 10,
+    SETSSID_RSP = 11,
+    RST_REQ = 12,
+    RST_RSP = 13
+};
+
+typedef void (* msg_pack_proc_fn)(struct espconn* pconn, char* pdata, unsigned short len);
+
+struct pack_proc {
+	enum msg_type msgtype;
+	msg_pack_proc_fn fn;
+};
 enum RUN_MODE runmode = MODE_UNKNOWN;
 enum CONNECT_STATUS client_status = STATUS_UNKNOWN; //为1则代表已连接到服务端
 
@@ -68,6 +96,7 @@ typedef struct _rw_info{
 	unsigned char ssid_pwd[16];
 	uint8 run_mode;
 	uint8 dev_type;
+	uint32 hash;
 } rw_info;
 
 
@@ -88,6 +117,7 @@ typedef struct _led_glint {
 
 
 typedef struct _heart_timer {
+	enum conn_mode mode;
 	struct espconn* conn;
 	ETSTimer* timer;
 } heart_timer;
@@ -101,7 +131,49 @@ void ICACHE_FLASH_ATTR connected_cloud_cb(void* param);
 void ICACHE_FLASH_ATTR disconnected_cloud_cb(void* param);
 void ICACHE_FLASH_ATTR restart_init_station_chk_timer(int interval);
 void ICACHE_FLASH_ATTR reconnect_cloud_cb(void* param, sint8 errcode);
-void ICACHE_FLASH_ATTR datareceived_cloud_cb(void* param, char* pdata, unsigned short len);
+void ICACHE_FLASH_ATTR data_received_cb(void* param, char* pdata, unsigned short len);
+void ICACHE_FLASH_ATTR server_listen();
+void ICACHE_FLASH_ATTR client_reconnect_cb(void* conn, sint8 err);
+typedef void (* msg_pack_proc_fn)(struct espconn* pconn, char* pdata, unsigned short len);
+
+
+void procfn_dev_rp_req(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_heart_req(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_gstatus_req(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_sstatus_req(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_dev_rp_rsp(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_heart_rsp(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_gstatus_rsp(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_sstatus_rsp(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_ledtest_req(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_ledtest_rsp(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_setssid_req(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_setssid_rsp(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_rst_req(struct espconn* pconn, char* pdata, unsigned short len);
+void procfn_rst_rsp(struct espconn* pconn, char* pdata, unsigned short len);
+
+
+static struct pack_proc gl_procs[] = {
+		{DEV_RP_REQ, procfn_dev_rp_req},
+		{HEART_REQ, procfn_heart_req},
+		{GSTATUS_REQ, procfn_gstatus_req},
+		{SSTATUS_REQ, procfn_sstatus_req},
+		{DEV_RP_RSP, procfn_dev_rp_rsp},
+		{HEART_RSP, procfn_heart_rsp},
+		{GSTATUS_RSP, procfn_gstatus_rsp},
+	    {SSTATUS_RSP, procfn_sstatus_rsp},
+	    {LEDTEST_REQ, procfn_ledtest_req},
+	    {LEDTEST_RSP, procfn_ledtest_rsp},
+	    {SETSSID_REQ, procfn_setssid_req},
+	    {SETSSID_RSP, procfn_setssid_rsp},
+	    {RST_REQ, procfn_rst_req},
+	    {RST_RSP, procfn_rst_rsp}
+
+};
+
+
+struct keys_param keys;
+struct single_key_param *single_key[1];
 
 
 conn_context* conn_context_init()
@@ -112,6 +184,33 @@ conn_context* conn_context_init()
 	context->bufsize = 0;
 
 	return context;
+}
+
+
+bool rw_check_hash(rw_info* prw)
+{
+	uint8 len = sizeof(rw_info);
+	uint32 hash = len, i=0;
+
+	os_printf("checking ... :[%p]\n", prw);
+	for(; i!=len - 4; ++i) {
+		hash += ((uint8*)prw)[i];
+	}
+
+	return hash == prw->hash;
+}
+
+
+void write_rw_hash(rw_info* prw)
+{
+	uint8 len = sizeof(rw_info);
+	uint32 hash = len, i = 0;
+
+	for(; i!=len - 4; ++i) {
+		hash += ((uint8*)prw)[i];
+	}
+
+	prw->hash = hash;
 }
 
 
@@ -156,6 +255,9 @@ void ICACHE_FLASH_ATTR raw_show(unsigned char* buf, size_t buflen)
 void ICACHE_FLASH_ATTR show_rw(rw_info* rw)
 {
 	raw_show((unsigned char*) rw, sizeof(rw_info));
+	if(rw->run_mode == MODE_UNKNOWN) {
+		//printf("error on ")
+	}
 	os_printf("Serv Addr: [" IPSTR "]\n", IP2STR(rw->server_addr));
 	os_printf("Serv Port: [%d]\n", rw->server_port);
 	os_printf("Our SSID: [%s]\n", rw->ssid_mine);
@@ -205,17 +307,23 @@ uint8 ICACHE_FLASH_ATTR write_cfg_flash(rw_info* prw)
 }
 
 
-uint8 ICACHE_FLASH_ATTR read_cfg_flash(rw_info* prw)
+bool ICACHE_FLASH_ATTR read_cfg_flash(rw_info* prw)
 {
 	if (spi_flash_read(FLASH_HEAD_ADDR, (uint32*) prw, sizeof(rw_info))
 			!= SPI_FLASH_RESULT_OK) {
 		os_printf("FLASH READ ERROR\n");
-		return -1;
+		return false;
 	}
 	os_printf("FLASH READ SUCCESS\n");
+
+	if(!rw_check_hash(prw)) {
+		os_printf("rw_info hash check error\n");
+		return false;
+	}
+	os_printf("rw_info hash check ok\n");
 	show_rw(prw);
 
-	return 0;
+	return true;
 }
 
 
@@ -353,7 +461,7 @@ void ICACHE_FLASH_ATTR connected_cloud_cb(void* param)
 	os_printf("connected_cloud_cb, conn: [%p]\n", conn);
 	client_status = STATUS_CONNECTED;
 	//注册 断开与接收、发送的回调
-	espconn_regist_recvcb(conn, datareceived_cloud_cb);
+	espconn_regist_recvcb(conn, data_received_cb);
 	espconn_regist_sentcb(conn, sent_cloud_cb);
 	espconn_regist_disconcb(conn, disconnected_cloud_cb);
 	//注册心跳回调
@@ -427,27 +535,141 @@ void ICACHE_FLASH_ATTR sent_cloud_cb(void* param)
 }
 
 
-//这里有可能需要加入 数据包的处理，譬如 多包同时到达，单包分次抵达
-void ICACHE_FLASH_ATTR datareceived_cloud_cb(void* param, char* pdata, unsigned short len)
+void procfn_dev_rp_req(struct espconn* pconn, char* pdata, unsigned short len)
 {
-	os_printf("datareceived_cloud_cb\n");
-	struct espconn* conn = (struct espconn*)param;
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
 
+	uint8 buf[2];
+	buf[0] = sizeof(buf);
+	buf[1] = DEV_RP_RSP;
+	espconn_sent(pconn, buf, 2);
+}
+
+void procfn_heart_req(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+	uint8 buf[2];
+
+	buf[0] = sizeof(buf);
+	buf[1] = HEART_RSP;
+	espconn_sent(pconn, buf, 2);
+}
+
+void procfn_gstatus_req(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+	uint8 buf[2];
+
+	buf[0] = sizeof(buf);
+	buf[1] = GSTATUS_RSP;
+
+	espconn_sent(pconn, buf, 2);
+}
+
+void procfn_sstatus_req(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+	uint8 buf[2];
+
+	buf[0] = sizeof(buf);
+	buf[1] = SSTATUS_RSP;
+
+	espconn_sent(pconn, buf, 2);
+}
+void procfn_dev_rp_rsp(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+}
+void procfn_heart_rsp(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+}
+void procfn_gstatus_rsp(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+}
+void procfn_sstatus_rsp(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+}
+
+void procfn_ledtest_req(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+	uint8 buf[2];
+
+	buf[0] = sizeof(buf);
+	buf[1] = LEDTEST_RSP;
+
+	espconn_sent(pconn, buf, 2);
+}
+void procfn_ledtest_rsp(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+}
+
+void procfn_setssid_req(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+	uint8 buf[2];
+
+	buf[0] = sizeof(buf);
+	buf[1] = SETSSID_RSP;
+
+	espconn_sent(pconn, buf, 2);
+}
+
+void procfn_setssid_rsp(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+}
+
+void procfn_rst_req(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+	uint8 buf[2];
+
+	buf[0] = sizeof(buf);
+	buf[1] = RST_RSP;
+
+	espconn_sent(pconn, buf, 2);
+}
+
+void procfn_rst_rsp(struct espconn* pconn, char* pdata, unsigned short len)
+{
+	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
+}
+
+//这里有可能需要加入 数据包的处理，譬如 多包同时到达，单包分次抵达
+void ICACHE_FLASH_ATTR data_received_cb(void* param, char* pdata, unsigned short len)
+{
+	struct espconn* conn = (struct espconn*)param;
+	os_printf("datareceived_cloud_cb, conn: [%p]\n", conn);
+	uint8 i = 0;
 	uint8 pack_len = pdata[0];
+	uint8 glfunc_size = sizeof(gl_procs) / sizeof(struct pack_proc);
+	msg_pack_proc_fn fn = NULL;
+	uint8 msgtype = pdata[1];
+	bool matched = false;
+
+	//TODO: 数据包可能分批抵达，亦可能一次抵达多个
 	if(len < pack_len) {
 		os_printf("network error, or pack error, or protocol error\n");
 		espconn_disconnect(conn);
+		return ;
 	}
 
-	uint8 msgtype = pdata[1];
-	if(msgtype == 0) {
-		//
-	} else if (msgtype == 1) {
-		//
-	} else if (msgtype == 2) {
-		//
-	} else if (msgtype == 3) {
-		//
+	for(; i != glfunc_size; ++i) {
+		if(msgtype == gl_procs[i].msgtype) {
+			matched = true;
+			fn = gl_procs[i].fn;
+			fn(conn, pdata, len);
+		}
+	}
+
+	if(!matched) {
+		os_printf("unknown protocol, connection [%p] closed\n", conn);
+		espconn_disconnect(conn);
 	}
 }
 
@@ -506,6 +728,11 @@ void ICACHE_FLASH_ATTR station_connect_status_check_timercb(void* _timer)
     }
 }
 
+/*
+ * 定时检查是否连接到云端，若未连接到云端则定时器开启，若已连接则关闭
+ * 从云端断开时，定时器将重新开启。
+ * station 模式使用
+ */
 void ICACHE_FLASH_ATTR restart_init_station_chk_timer(int interval)
 {
 	os_printf("启动计时器\n");
@@ -513,6 +740,89 @@ void ICACHE_FLASH_ATTR restart_init_station_chk_timer(int interval)
     os_timer_setfn(&station_chk_timer, station_connect_status_check_timercb, &station_chk_timer);
     os_timer_arm(&station_chk_timer, interval, 1);// 重复，每秒检查一次，若连上后取消，连接断开或其他事件重启此 timer
     os_printf("station checker timer start completed\n");
+}
+
+void free_connection(struct espconn* pconn)
+{
+	heart_timer* pheart = (heart_timer*)pconn->reverse;
+	os_timer_disarm(pheart->timer);
+	os_free(pheart->timer);
+	os_free(pheart);
+	os_free(pconn->proto.tcp);
+	os_free(pconn);
+}
+
+
+void client_disconnected_cb(void* conn)
+{
+	struct espconn* pconn = (struct espconn*)conn;
+	os_printf("client disconnected\n");
+	os_printf("debug: [%p], [" IPSTR ":%d], state, [%d]\n",
+			pconn, IP2STR(pconn->proto.tcp->remote_ip), pconn->proto.tcp->remote_port, pconn->state);
+}
+
+
+void ICACHE_FLASH_ATTR client_connected_cb(void* conn)
+{
+	struct espconn* pconn = (struct espconn*)conn;
+	os_printf("client connected\n");
+	os_printf("debug: [%p], [" IPSTR ":%d], state, [%d]\n",
+			pconn, IP2STR(pconn->proto.tcp->remote_ip), pconn->proto.tcp->remote_port, pconn->state);
+
+	espconn_regist_recvcb(pconn, data_received_cb);
+	espconn_regist_sentcb(pconn, sent_cloud_cb);
+	espconn_regist_disconcb(pconn, client_disconnected_cb);
+	espconn_regist_reconcb(pconn, client_reconnect_cb);
+}
+
+
+void ICACHE_FLASH_ATTR client_reconnect_cb(void* conn, sint8 err)
+{
+	struct espconn* pconn = (struct espconn*)conn;
+	os_printf("client connection error: [%d]\n", err);
+
+	free_connection(pconn);
+	//server_listen();
+}
+
+
+void ICACHE_FLASH_ATTR server_listen()
+{
+	os_printf("begin server_listen\n");
+	struct espconn* pconn = (struct espconn*)os_zalloc(sizeof(struct espconn));
+	esp_tcp* ptcp = (esp_tcp*)os_zalloc(sizeof(esp_tcp));
+	heart_timer* pheart = (heart_timer*)os_zalloc(sizeof(heart_timer));
+	ETSTimer* ptimer = (ETSTimer*)os_zalloc(sizeof(ETSTimer));
+
+	pconn->state = ESPCONN_NONE;
+	pconn->type = ESPCONN_TCP;
+	pconn->proto.tcp = ptcp;
+	pconn->proto.tcp->local_port = LOCAL_SERVER_PORT;
+	pheart->mode = MODE_SERVER;
+	pheart->conn = pconn;
+	pheart->timer = ptimer;
+	pconn->reverse = (void*)pheart;
+
+	espconn_regist_connectcb(pconn, client_connected_cb);
+
+	espconn_accept(pconn);
+	espconn_regist_time(pconn, 0, 0);
+	os_printf("server_listen ok, conn: [%p]\n", pconn);
+}
+
+void ICACHE_FLASH_ATTR listen_chk_timer_cb(void* _timer)
+{
+	//start tcp listen ...
+	os_printf("listen chk timer cb, timer: [%p]\n", _timer);
+	ETSTimer* timer = (ETSTimer*)_timer;
+	uint8 mode = wifi_get_opmode();
+	if(mode == STATION_MODE && wifi_station_get_connect_status() != STATION_GOT_IP) {
+		os_printf("station cannot got ip , cannot start server listen.\n");
+		return ;
+	}
+
+	os_timer_disarm(timer);
+	server_listen();
 }
 
 
@@ -525,6 +835,8 @@ void ICACHE_FLASH_ATTR user_btn_long_press()
 void ICACHE_FLASH_ATTR user_btn_short_press()
 {
 	os_printf("ON SHORT PRESS\n");
+	struct sensor_reading* dht = readDHT(0);
+	os_printf("Temperature: [%f], humidity: [%f]\n", dht->temperature, dht->humidity);
 }
 /******************************************************************************
  * FunctionName : user_init
@@ -532,9 +844,6 @@ void ICACHE_FLASH_ATTR user_btn_short_press()
  * Parameters   : none
  * Returns      : none
 *******************************************************************************/
-
-struct keys_param keys;
-struct single_key_param *single_key[1];
 
 void ICACHE_FLASH_ATTR user_init(void)
 {
@@ -544,7 +853,9 @@ void ICACHE_FLASH_ATTR user_init(void)
     rw_info rw;
     os_memset(&rw, 0, sizeof(rw_info));
 
-    read_cfg_flash(&rw);
+    if(!read_cfg_flash(&rw)) {
+    	rw.run_mode = WIFI_BOARDCAST;
+    }
     //startup_ledshow(&rw);
 
     single_key[0] = key_init_single(13, PERIPHS_IO_MUX_MTCK_U, FUNC_GPIO13,
@@ -554,18 +865,7 @@ void ICACHE_FLASH_ATTR user_init(void)
     keys.single_key = single_key;
 
     key_init(&keys);
-
-
-#if 0
-    os_printf("ipaddr_addr test\n");
-    os_printf("127.0.0.1: [%d]\n", ipaddr_addr("127.0.0.1"));
-    os_printf("192.168.0.1: [%d]\n", ipaddr_addr("192.168.0.1"));
-    os_printf("8.8.8.8: [%d]\n", ipaddr_addr("8.8.8.8"));
-    os_printf("211.155.86.145: [%d]\n", ipaddr_addr("211.155.86.145"));
-
-    uint32 ipnum = ipaddr_addr("211.155.86.145");
-    os_printf("211.155.86.145: [" IPSTR "]\n", IP2STR(ipnum));
-    os_printf("ipaddr_addr test over\n");
+    //DHTInit(SENSOR_DHT11, 5000);
 
     if(rw.run_mode == CLIENT_ONLY) {
     	os_printf("run in client only mode\n");
@@ -586,42 +886,54 @@ void ICACHE_FLASH_ATTR user_init(void)
         restart_init_station_chk_timer(1000);
     } else if (rw.run_mode == WIFI_BOARDCAST) {
     	os_printf("run in wifi_boardcast mode\n");
-//		wifi_set_opmode(SOFTAP_MODE);
-//		struct softap_config apconfig;
-//		memset(&apconfig, 0, sizeof(struct softap_config));
-//		os_strcpy(apconfig.ssid, DEFAULT_SSID);
-//		os_strcpy(apconfig.password, DEFAULT_SSID_PWD);
-//		apconfig.ssid_len = 0;
-//		apconfig.authmode = AUTH_WPA_WPA2_PSK;
-//		apconfig.ssid_hidden = 0;
-//		apconfig.max_connection = 5;
-//		apconfig.beacon_interval = 100;
-//
-//		if (!wifi_softap_set_config(&apconfig)) {
-//			printf("[%s] [%s] ERROR\n", __func__,
-//					"wifi_softap_set_config");
-//		}
-//		printf("wifi_softap_set_config success\n");
-//
-//		struct ip_info ipinfo;
-//
-//        ipinfo.gw.addr = ipaddr_addr(DEFAULT_GWADDR);
-//    	ipinfo.ip.addr = ipaddr_addr(DEFAULT_GWADDR);
-//    	ipinfo.netmask.addr = ipaddr_addr("255.255.255.0");
-//
-//    	wifi_set_ip_info(SOFTAP_IF, &ipinfo);
-//
-//    	struct dhcps_lease please;
-//    	please.start_ip = ipaddr_addr(DHCP_BEGIN_ADDR);
-//    	please.end_ip = ipaddr_addr(DHCP_END_ADDR);
-//
-//    	if(!wifi_softap_set_dhcps_lease(&please)) {
-//    		printf("wifi_softap_set_dhcps_lease error\n");
-//    	}
+		if(!wifi_set_opmode(SOFTAP_MODE)) {
+			os_printf("wifi set opmode to softap error\n");
+			//可以停机了。。。
+		}
+		os_printf("wifi set opmode softap ok\n");
+
+		struct softap_config apconfig;
+		memset(&apconfig, 0, sizeof(struct softap_config));
+		os_strcpy(apconfig.ssid, DEFAULT_SSID);
+		os_strcpy(apconfig.password, DEFAULT_SSID_PWD);
+		apconfig.ssid_len = 0;
+		apconfig.authmode = AUTH_WPA_WPA2_PSK;
+		apconfig.ssid_hidden = 0;
+		apconfig.max_connection = 5;
+		apconfig.beacon_interval = 100;
+
+		if (!wifi_softap_set_config(&apconfig)) {
+			os_printf("[%s] [%s] ERROR\n", __func__,
+					"wifi_softap_set_config");
+		}
+		os_printf("wifi_softap_set_config success\n");
+
+		struct ip_info ipinfo;
+
+        ipinfo.gw.addr = ipaddr_addr(DEFAULT_GWADDR);
+    	ipinfo.ip.addr = ipaddr_addr(DEFAULT_GWADDR);
+    	ipinfo.netmask.addr = ipaddr_addr("255.255.255.0");
+
+    	if(!wifi_set_ip_info(SOFTAP_IF, &ipinfo)) {
+    		os_printf("wifi_set_ip_info error\n");
+    		//my god...
+    	}
+
+    	struct dhcps_lease please;
+    	please.start_ip.addr = ipaddr_addr(DHCP_BEGIN_ADDR);
+    	please.end_ip.addr = ipaddr_addr(DHCP_END_ADDR);
+
+    	if(!wifi_softap_set_dhcps_lease(&please)) {
+    		os_printf("wifi_softap_set_dhcps_lease error\n");
+    		//unknown...
+    	}
+    	os_printf("wifi_softap_dhcps config lease ok\n");
     }
 
     os_printf("OVER\n");
+	os_timer_disarm(&server_listen_chk_timer);
+	os_timer_setfn(&server_listen_chk_timer, listen_chk_timer_cb, &server_listen_chk_timer);
+	os_timer_arm(&server_listen_chk_timer, 1000, 1);
     system_init_done_cb(init_over);
-#endif
 }
 
