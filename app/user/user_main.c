@@ -46,7 +46,7 @@ enum DEV_TYPE {
 };
 
 enum RUN_MODE {
-	MODE_UNKNOWN, WIFI_BOARDCAST, CLIENT_ONLY
+	MODE_UNKNOWN, MODE_SOFTAP, MODE_STATION
 };
 
 enum CONNECT_STATUS {
@@ -56,11 +56,11 @@ enum CONNECT_STATUS {
 	STATUS_DISCONNECTED
 };
 
-enum conn_mode {
+enum CONN_TYPE {
 	MODE_CLIENT, MODE_SERVER
 };
 
-enum msg_type {
+enum MSG_TYPE {
     DEV_RP_REQ = 0,
     HEART_REQ = 1,
     GSTATUS_REQ = 2,
@@ -80,7 +80,7 @@ enum msg_type {
 typedef void (* msg_pack_proc_fn)(struct espconn* pconn, char* pdata, unsigned short len);
 
 struct pack_proc {
-	enum msg_type msgtype;
+	enum MSG_TYPE msgtype;
 	msg_pack_proc_fn fn;
 };
 enum RUN_MODE runmode = MODE_UNKNOWN;
@@ -117,7 +117,7 @@ typedef struct _led_glint {
 
 
 typedef struct _heart_timer {
-	enum conn_mode mode;
+	enum CONN_TYPE mode;
 	struct espconn* conn;
 	ETSTimer* timer;
 } heart_timer;
@@ -315,13 +315,6 @@ bool ICACHE_FLASH_ATTR read_cfg_flash(rw_info* prw)
 	}
 	os_printf("FLASH READ SUCCESS\n");
 
-	if(!rw_check_hash(prw)) {
-		os_printf("rw_info hash check error\n");
-		return false;
-	}
-	os_printf("rw_info hash check ok\n");
-	show_rw(prw);
-
 	return true;
 }
 
@@ -426,9 +419,9 @@ void ICACHE_FLASH_ATTR startup_ledshow(rw_info* rw)
 	PIN_FUNC_SELECT(PERIPHS_IO_MUX_MTCK_U, FUNC_GPIO13);
 	PIN_FUNC_SELECT(PERIPHS_IO_MUX_MTMS_U,FUNC_GPIO14);
 
-	if(rw->run_mode == CLIENT_ONLY) {
+	if(rw->run_mode == MODE_STATION) {
 		led->pin = BIT12;
-	} else if(rw->run_mode == WIFI_BOARDCAST) {
+	} else if(rw->run_mode == MODE_SOFTAP) {
 		led->pin = BIT13;
 	} else {
 		led->pin = BIT14;
@@ -641,8 +634,10 @@ void procfn_setssid_req(struct espconn* pconn, char* pdata, unsigned short len)
 		os_printf("cfg read from flash error\n");
 	}
 
+	rwinfo_init(&rw);
 	os_strcpy(rw.ssid, ssid);
 	os_strcpy(rw.ssid_pwd, pwd);
+	rw.run_mode = MODE_STATION;
 	write_rw_hash(&rw);
 	write_cfg_flash(&rw);
 
@@ -841,7 +836,7 @@ void ICACHE_FLASH_ATTR server_listen()
 	espconn_regist_connectcb(pconn, client_connected_cb);
 
 	espconn_accept(pconn);
-	espconn_regist_time(pconn, 0, 0);
+	espconn_regist_time(pconn, 120, 0);
 	os_printf("server_listen ok, conn: [%p]\n", pconn);
 }
 
@@ -889,8 +884,16 @@ void ICACHE_FLASH_ATTR user_init(void)
     os_memset(&rw, 0, sizeof(rw_info));
 
     if(!read_cfg_flash(&rw)) {
-    	rw.run_mode = WIFI_BOARDCAST;
+    	rw.run_mode = MODE_SOFTAP;
     }
+
+    if(!rw_check_hash(&rw)) {
+    	os_printf("rw check hash error\n");
+    	rw.run_mode = MODE_SOFTAP;
+    } else {
+    	show_rw(&rw);
+    }
+
     //startup_ledshow(&rw);
 
     single_key[0] = key_init_single(13, PERIPHS_IO_MUX_MTCK_U, FUNC_GPIO13,
@@ -902,7 +905,7 @@ void ICACHE_FLASH_ATTR user_init(void)
     key_init(&keys);
     //DHTInit(SENSOR_DHT11, 5000);
 
-    if(rw.run_mode == CLIENT_ONLY) {
+    if(rw.run_mode == MODE_STATION) {
     	os_printf("run in client only mode\n");
 		wifi_set_opmode(STATION_MODE);
         struct station_config config;
@@ -919,7 +922,7 @@ void ICACHE_FLASH_ATTR user_init(void)
         //若成功连接到云端，则关闭定时器
         //若从云端断开连接，则重启定时器
         restart_init_station_chk_timer(1000);
-    } else if (rw.run_mode == WIFI_BOARDCAST) {
+    } else if (rw.run_mode == MODE_SOFTAP) {
     	os_printf("run in wifi_boardcast mode\n");
 		if(!wifi_set_opmode(SOFTAP_MODE)) {
 			os_printf("wifi set opmode to softap error\n");
