@@ -175,17 +175,6 @@ struct keys_param keys;
 struct single_key_param *single_key[1];
 
 
-conn_context* conn_context_init()
-{
-	conn_context* context = (conn_context*)os_zalloc(sizeof(conn_context));
-
-	context->buffer = NULL;
-	context->bufsize = 0;
-
-	return context;
-}
-
-
 bool rw_check_hash(rw_info* prw)
 {
 	uint8 len = sizeof(rw_info);
@@ -376,6 +365,7 @@ void ICACHE_FLASH_ATTR _gpio_high(void* time_arg)
 	if(led->limit_count && led->cur_count >= led->limit_count) {
 		os_free(timer);
 		os_free(led);
+		os_printf("free timer and led_glint.\n");
 		return ;
 	}
 
@@ -437,11 +427,15 @@ void ICACHE_FLASH_ATTR startup_ledshow(rw_info* rw)
 void ICACHE_FLASH_ATTR heart_beat_cbfn(void* param)
 {
 	heart_timer* pheart = (heart_timer*)param;
+	//需要判断网络状态。。。
+	struct espconn* pconn = pheart->conn;
+	os_printf("conn: [%p], state: [%d]\n", pconn, pconn->state);
+
 	uint8 buf[2];
 
 	buf[0] = 2;
 	buf[1] = 1;
-	espconn_sent(pheart->conn, buf, 2);
+	espconn_sent(pconn, buf, 2);
 }
 
 
@@ -652,6 +646,14 @@ void procfn_setssid_rsp(struct espconn* pconn, char* pdata, unsigned short len)
 	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
 }
 
+
+void restart_timer_cb(void* timer)
+{
+	os_printf("BE WILL RESTARTED\n");
+	system_restart();
+}
+
+
 void procfn_rst_req(struct espconn* pconn, char* pdata, unsigned short len)
 {
 	os_printf("Enter %s, pconn: [%p], buf: [%p], len:[%d]\n", __func__, pconn, pdata, len);
@@ -662,7 +664,12 @@ void procfn_rst_req(struct espconn* pconn, char* pdata, unsigned short len)
 
 	espconn_sent(pconn, buf, 2);
 	espconn_disconnect(pconn);
-	system_restart();
+
+	//直接调用restart总是故障，改用定时器，100毫秒后重启，顺带也可以把网络数据发出去
+	ETSTimer* ptimer = (ETSTimer*)os_zalloc(sizeof(ETSTimer));
+	os_timer_disarm(ptimer);
+	os_timer_setfn(ptimer, restart_timer_cb, ptimer);
+	os_timer_arm(ptimer, 100, 0);
 }
 
 void procfn_rst_rsp(struct espconn* pconn, char* pdata, unsigned short len)
@@ -753,7 +760,13 @@ void ICACHE_FLASH_ATTR station_connect_status_check_timercb(void* _timer)
     	client_status = STATUS_CONNECTING;
     }
 
+    //连接成功后停止定时器
     if(client_status == STATUS_CONNECTED) {
+    	os_timer_disarm(timer);
+    }
+
+    //如果系统模式非station模式，则停止
+    if(wifi_get_opmode() != STATION_MODE) {
     	os_timer_disarm(timer);
     }
 }
@@ -840,6 +853,7 @@ void ICACHE_FLASH_ATTR server_listen()
 	os_printf("server_listen ok, conn: [%p]\n", pconn);
 }
 
+
 void ICACHE_FLASH_ATTR listen_chk_timer_cb(void* _timer)
 {
 	//start tcp listen ...
@@ -859,22 +873,75 @@ void ICACHE_FLASH_ATTR listen_chk_timer_cb(void* _timer)
 void ICACHE_FLASH_ATTR user_btn_long_press()
 {
 	os_printf("ON LONG PRESS\n");
+	rw_info rw;
+
+	read_cfg_flash(&rw);
+	rw.run_mode = MODE_SOFTAP;
+	write_rw_hash(&rw);
+	write_cfg_flash(&rw);
+	system_restart();
 }
 
 
 void ICACHE_FLASH_ATTR user_btn_short_press()
 {
 	os_printf("ON SHORT PRESS\n");
-	struct sensor_reading* dht = readDHT(0);
-	os_printf("Temperature: [%f], humidity: [%f]\n", dht->temperature, dht->humidity);
 }
+
+
+void ICACHE_FLASH_ATTR set_softap_mode()
+{
+	os_printf("run in wifi_boardcast mode\n");
+	if(!wifi_set_opmode(SOFTAP_MODE)) {
+		os_printf("wifi set opmode to softap error\n");
+		//可以停机了。。。
+	}
+	os_printf("wifi set opmode softap ok\n");
+
+	struct softap_config apconfig;
+	memset(&apconfig, 0, sizeof(struct softap_config));
+	os_strcpy(apconfig.ssid, DEFAULT_SSID);
+	os_strcpy(apconfig.password, DEFAULT_SSID_PWD);
+	apconfig.ssid_len = 0;
+	apconfig.authmode = AUTH_WPA_WPA2_PSK;
+	apconfig.ssid_hidden = 0;
+	apconfig.max_connection = 5;
+	apconfig.beacon_interval = 100;
+
+	if (!wifi_softap_set_config(&apconfig)) {
+		os_printf("[%s] [%s] ERROR\n", __func__,
+				"wifi_softap_set_config");
+	}
+	os_printf("wifi_softap_set_config success\n");
+
+	struct ip_info ipinfo;
+
+    ipinfo.gw.addr = ipaddr_addr(DEFAULT_GWADDR);
+	ipinfo.ip.addr = ipaddr_addr(DEFAULT_GWADDR);
+	ipinfo.netmask.addr = ipaddr_addr("255.255.255.0");
+
+	if(!wifi_set_ip_info(SOFTAP_IF, &ipinfo)) {
+		os_printf("wifi_set_ip_info error\n");
+		//my god...
+	}
+
+	struct dhcps_lease please;
+	please.start_ip.addr = ipaddr_addr(DHCP_BEGIN_ADDR);
+	please.end_ip.addr = ipaddr_addr(DHCP_END_ADDR);
+
+	if(!wifi_softap_set_dhcps_lease(&please)) {
+		os_printf("wifi_softap_set_dhcps_lease error\n");
+		//unknown...
+	}
+	os_printf("wifi_softap_dhcps config lease ok\n");
+}
+
 /******************************************************************************
  * FunctionName : user_init
  * Description  : entry of user application, init user function here
  * Parameters   : none
  * Returns      : none
 *******************************************************************************/
-
 void ICACHE_FLASH_ATTR user_init(void)
 {
 	uart_init(BIT_RATE_115200, BIT_RATE_115200);
@@ -923,49 +990,7 @@ void ICACHE_FLASH_ATTR user_init(void)
         //若从云端断开连接，则重启定时器
         restart_init_station_chk_timer(1000);
     } else if (rw.run_mode == MODE_SOFTAP) {
-    	os_printf("run in wifi_boardcast mode\n");
-		if(!wifi_set_opmode(SOFTAP_MODE)) {
-			os_printf("wifi set opmode to softap error\n");
-			//可以停机了。。。
-		}
-		os_printf("wifi set opmode softap ok\n");
-
-		struct softap_config apconfig;
-		memset(&apconfig, 0, sizeof(struct softap_config));
-		os_strcpy(apconfig.ssid, DEFAULT_SSID);
-		os_strcpy(apconfig.password, DEFAULT_SSID_PWD);
-		apconfig.ssid_len = 0;
-		apconfig.authmode = AUTH_WPA_WPA2_PSK;
-		apconfig.ssid_hidden = 0;
-		apconfig.max_connection = 5;
-		apconfig.beacon_interval = 100;
-
-		if (!wifi_softap_set_config(&apconfig)) {
-			os_printf("[%s] [%s] ERROR\n", __func__,
-					"wifi_softap_set_config");
-		}
-		os_printf("wifi_softap_set_config success\n");
-
-		struct ip_info ipinfo;
-
-        ipinfo.gw.addr = ipaddr_addr(DEFAULT_GWADDR);
-    	ipinfo.ip.addr = ipaddr_addr(DEFAULT_GWADDR);
-    	ipinfo.netmask.addr = ipaddr_addr("255.255.255.0");
-
-    	if(!wifi_set_ip_info(SOFTAP_IF, &ipinfo)) {
-    		os_printf("wifi_set_ip_info error\n");
-    		//my god...
-    	}
-
-    	struct dhcps_lease please;
-    	please.start_ip.addr = ipaddr_addr(DHCP_BEGIN_ADDR);
-    	please.end_ip.addr = ipaddr_addr(DHCP_END_ADDR);
-
-    	if(!wifi_softap_set_dhcps_lease(&please)) {
-    		os_printf("wifi_softap_set_dhcps_lease error\n");
-    		//unknown...
-    	}
-    	os_printf("wifi_softap_dhcps config lease ok\n");
+    	set_softap_mode();
     }
 
     os_printf("OVER\n");
