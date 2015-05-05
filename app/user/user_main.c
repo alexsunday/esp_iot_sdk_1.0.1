@@ -886,6 +886,10 @@ void ICACHE_FLASH_ATTR user_btn_long_press()
 void ICACHE_FLASH_ATTR user_btn_short_press()
 {
 	os_printf("ON SHORT PRESS\n");
+	uint32 iRet = 100;
+
+	iRet = GPIO_INPUT_GET(14);
+	os_printf("OUT: [%d]\n", iRet);
 }
 
 
@@ -972,6 +976,11 @@ void ICACHE_FLASH_ATTR user_init(void)
     key_init(&keys);
     //DHTInit(SENSOR_DHT11, 5000);
 
+	PIN_FUNC_SELECT(PERIPHS_IO_MUX_MTMS_U,FUNC_GPIO14);
+	gpio_output_set(0, 0, 0, BIT14);
+
+
+#if 0
     if(rw.run_mode == MODE_STATION) {
     	os_printf("run in client only mode\n");
 		wifi_set_opmode(STATION_MODE);
@@ -998,5 +1007,6 @@ void ICACHE_FLASH_ATTR user_init(void)
 	os_timer_setfn(&server_listen_chk_timer, listen_chk_timer_cb, &server_listen_chk_timer);
 	os_timer_arm(&server_listen_chk_timer, 1000, 1);
     system_init_done_cb(init_over);
+#endif
 }
 
